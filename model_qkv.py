@@ -58,12 +58,12 @@ class CausalSelfAttention(nn.Module):
             )
         self.debug = {
             "softmax(Q)": None,
-            "softmax(QK.T)K": None,
+            "unscaled_softmax(QK.T)K": None,
             "softmax(K.T)K": None,
             "K.TK": None,
             "Q": None,
             "K": None,
-            "softmax(QK.T)": None,
+            "unscaled_softmax(QK.T)": None,
             "softmax(Q,-1)softmax(K.T,-2)": None,
         }
 
@@ -74,6 +74,9 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        v: Any = v.view(B, T, self.n_head, C // self.n_head).transpose(
+            1, 2
+        )
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(
             1, 2
         )  # (B, nh, T, hs)
@@ -88,7 +91,7 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,
-                k,
+                v,
                 attn_mask=None,
                 dropout_p=self.dropout if self.training else 0,
                 is_causal=True,
@@ -99,7 +102,7 @@ class CausalSelfAttention(nn.Module):
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ k  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = (
             y.transpose(1, 2).contiguous().view(B, T, C)
         )  # re-assemble all head outputs side by side
@@ -107,8 +110,14 @@ class CausalSelfAttention(nn.Module):
         self.debug["softmax(Q)"] = (
             q.softmax(dim=-1).detach().cpu().to(dtype=torch.float32)
         )
-        self.debug["softmax(QK.T)K"] = (
+        self.debug["unscaled_softmax(QK.T)K"] = (
             ((q @ k.transpose(-1, -2)).softmax(dim=-1) @ k)
+            .detach()
+            .cpu()
+            .to(dtype=torch.float32)
+        )
+        self.debug["scaled_softmax(QK.T)K"] = (
+            ((q @ k.transpose(-1, -2) / (C // self.n_head) ** 0.5).softmax(dim=-1) @ k)
             .detach()
             .cpu()
             .to(dtype=torch.float32)
@@ -131,8 +140,14 @@ class CausalSelfAttention(nn.Module):
             .cpu()
             .to(dtype=torch.float32)
         )
-        self.debug["softmax(QK.T)"] = (
+        self.debug["unscaled_softmax(QK.T)"] = (
             ((q @ k.transpose(-1, -2)).softmax(dim=-1))
+            .detach()
+            .cpu()
+            .to(dtype=torch.float32)
+        )
+        self.debug["scaled_softmax(QK.T)"] = (
+            ((q @ k.transpose(-1, -2) / (C // self.n_head) ** 0.5).softmax(dim=-1))
             .detach()
             .cpu()
             .to(dtype=torch.float32)
@@ -270,7 +285,7 @@ class GPT(nn.Module):
         import os
         import time
 
-        parent_path = f"test8-{time.time()}"
+        parent_path = f"qkv-candidate-2 (Use real GPT-2-medium weights)" # f"test8-{time.time()}"
         os.mkdir(path=parent_path)
         for block_num, block in enumerate(self.transformer.h):
 
@@ -323,15 +338,27 @@ class GPT(nn.Module):
                         )
 
                         plt.imshow(
-                            raw_data["softmax(QK.T)K"][batch, n_head],
+                            raw_data["scaled_softmax(QK.T)K"][batch, n_head],
                             cmap="viridis",
                             interpolation="nearest",
                         )
-                        plt.title(f"Softmax(QK.T, dim=-1)K on a QKK model.\nlayer {block_num}, batch {batch}")
+                        plt.title(f"Softmax(QK.T/sqrt(hs))K on a QKK model.\nlayer {block_num}, batch {batch}")
                         plt.xlabel("Head Size")
                         plt.ylabel("Sequence")
                         plt.savefig(
                             f"{head_dir}/{block_num}-{batch}-{n_head}-softmax(QKT)K.png"
+                        )
+
+                        plt.imshow(
+                            raw_data["unscaled_softmax(QK.T)K"][batch, n_head],
+                            cmap="viridis",
+                            interpolation="nearest",
+                        )
+                        plt.title(f"Softmax(QK.T))K on a QKK model.\nlayer {block_num}, batch {batch}")
+                        plt.xlabel("Head Size")
+                        plt.ylabel("Sequence")
+                        plt.savefig(
+                            f"{head_dir}/{block_num}-{batch}-{n_head}-unscaledsoftmax(QKT)K.png"
                         )
 
                         plt.imshow(
@@ -341,21 +368,45 @@ class GPT(nn.Module):
                         )
                         plt.title(f"K.TK matrix on a QKK model.\nlayer {block_num}, batch {batch}")
                         plt.xlabel("Head Size")
-                        plt.ylabel("Sequence")
+                        plt.ylabel("Head Size")
                         plt.savefig(
                             f"{head_dir}/{block_num}-{batch}-{n_head}-KTK.png"
                         )
 
                         plt.imshow(
-                            raw_data["softmax(QK.T)"][batch, n_head],
+                            raw_data["softmax(K.T)K"][batch, n_head],
+                            cmap="viridis",
+                            interpolation="nearest",
+                        )
+                        plt.title(f"softmax(K.T)K\nlayer {block_num}, batch {batch}")
+                        plt.xlabel("Head size")
+                        plt.ylabel("Head size")
+                        plt.savefig(
+                            f"{head_dir}/{block_num}-{batch}-{n_head}-softmax(KT)K.png"
+                        )
+
+                        plt.imshow(
+                            raw_data["scaled_softmax(QK.T)"][batch, n_head],
+                            cmap="viridis",
+                            interpolation="nearest",
+                        )
+                        plt.title(f"softmax(QK.T / sqrt(hs)) on a QKK model.\nlayer {block_num}, batch {batch}")
+                        plt.xlabel("Sequence")
+                        plt.ylabel("Sequence")
+                        plt.savefig(
+                            f"{head_dir}/{block_num}-{batch}-{n_head}-scaledsoftmax(QK.T).png"
+                        )
+
+                        plt.imshow(
+                            raw_data["unscaled_softmax(QK.T)"][batch, n_head],
                             cmap="viridis",
                             interpolation="nearest",
                         )
                         plt.title(f"softmax(QK.T) on a QKK model.\nlayer {block_num}, batch {batch}")
-                        plt.xlabel("Head Size")
+                        plt.xlabel("Sequence")
                         plt.ylabel("Sequence")
                         plt.savefig(
-                            f"{head_dir}/{block_num}-{batch}-{n_head}-softmax(QK.T).png"
+                            f"{head_dir}/{block_num}-{batch}-{n_head}-unscaledsoftmax(QK.T).png"
                         )
 
                         plt.imshow(
@@ -364,7 +415,7 @@ class GPT(nn.Module):
                             interpolation="nearest",
                         )
                         plt.title(f"softmax(Q)softmax(K.T) on a QKK model.\nlayer {block_num}, batch {batch}")
-                        plt.xlabel("Head Size")
+                        plt.xlabel("Sequence")
                         plt.ylabel("Sequence")
                         plt.savefig(
                             f"{head_dir}/{block_num}-{batch}-{n_head}-smsm.png"
@@ -393,7 +444,7 @@ class GPT(nn.Module):
                         plt.savefig(
                             f"{head_dir}/{block_num}-{batch}-{n_head}-K.png"
                         )
-
+                        """
                         import plotly.express as px
 
                         x_data, y_data = (
@@ -411,24 +462,9 @@ class GPT(nn.Module):
                             f"{head_dir}/{block_num}-{batch}-smq-normalized-scatter.png-r={stats.pearsonr(x_data, y_data)[0]}.png"
                         )
                         print(f"Correlation: {stats.pearsonr(x_data, y_data)[0]}")
+                        """
 
-                        plt.imshow(
-                            raw_data["softmax(K.T)K"][batch, n_head],
-                            cmap="viridis",
-                            interpolation="nearest",
-                        )
-                        plt.title(f"layer {block_num}, batch {batch}, softmax(K.T)K")
-                        plt.savefig(
-                            f"{head_dir}/{block_num}-{batch}-{n_head}-softmax(KT)K.png"
-                        )
 
-                        plt.imshow(
-                            raw_data["K.TK"][batch, n_head],
-                            cmap="viridis",
-                            interpolation="nearest",
-                        )
-                        plt.title(f"layer {block_num}, batch {batch}, K.TK")
-                        plt.savefig(f"{head_dir}/{block_num}-{batch}-{n_head}-KTK.png")
 
             block.register_forward_hook(block_hook)
             x = block(x)
